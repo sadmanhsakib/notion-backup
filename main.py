@@ -1,3 +1,4 @@
+import shutil
 import json
 import logging
 import os
@@ -15,7 +16,7 @@ load_dotenv()
 
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 BACKUP_OUTPUT_DIR = Path(os.getenv("BACKUP_OUTPUT_DIR"))
-
+MAX_BACKUP = int(os.getenv("MAX_BACKUP", 3))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,11 +85,8 @@ class NotionBackup:
             "rows": backed_up_rows,
         }
 
-    def run(self) -> Path:
-        """
-        Run a full workspace backup.
-        Returns the path to the timestamped backup folder created.
-        """
+    def run(self):
+        """Run a full workspace backup."""
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup_dir = self.output_dir / f"backup_{timestamp}"
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -147,7 +145,6 @@ class NotionBackup:
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
         log.info("Backup complete in %.1fs", elapsed)
-        return backup_dir
 
 
 def main():
@@ -155,6 +152,12 @@ def main():
 
     backup = NotionBackup(notion=notion, output_dir=BACKUP_OUTPUT_DIR)
     backup.run()
+
+    backup_list = os.listdir(BACKUP_OUTPUT_DIR)
+
+    if len(backup_list) > MAX_BACKUP:
+        oldest_backup = min(backup_list, key=os.path.getctime)
+        shutil.rmtree(oldest_backup)
 
 
 def paginate(fn, **kwargs) -> list:
