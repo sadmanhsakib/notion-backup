@@ -1,0 +1,10 @@
+[project]
+name = "notion-backup"
+version = "0.1.0"
+description = "Backup notes from notion to local drive storage"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dotenv>=0.9.9",
+    "notion-client>=3.1.0",
+]
