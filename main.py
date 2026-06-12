@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 import shutil
 import time
 import mimetypes
@@ -376,7 +377,7 @@ def main():
     backup.run()
 
     backup_filenames = [
-        f for f in os.listdir(OUTPUT_DIR) if f.startswith("backup_")
+        f for f in os.listdir(BACKUP_OUTPUT_DIR) if f.startswith("backup_")
     ]
 
     if MAX_BACKUP > 0 and len(backup_filenames) > MAX_BACKUP:
@@ -387,6 +388,46 @@ def main():
             log.info("Deleted old backup → %s", filename)
 
 
+def retry_with_backoff(fn, *args, max_retries: int = 5, **kwargs):
+    """
+    Call ``fn(*args, **kwargs)`` and retry on HTTP 429 (rate-limited) responses.
+
+    Back-off strategy:
+      1. Honour the ``Retry-After`` header returned by Notion when present.
+      2. Otherwise use exponential back-off with full jitter:
+         wait = random(0, min(cap, base * 2 ** attempt))  where base=1s, cap=64s.
+
+    Raises the last ``APIResponseError`` if all retries are exhausted.
+    """
+    base, cap = 1.0, 64.0
+    for attempt in range(max_retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except APIResponseError as exc:
+            # notion-client surfaces the HTTP status on exc.status
+            if exc.status != 429 or attempt == max_retries:
+                raise
+
+            # Respect Retry-After if the server told us how long to wait.
+            retry_after = None
+            if hasattr(exc, "headers") and exc.headers:
+                raw = exc.headers.get("Retry-After") or exc.headers.get("retry-after")
+                if raw:
+                    try:
+                        retry_after = float(raw)
+                    except ValueError:
+                        pass
+
+            wait = retry_after if retry_after else random.uniform(0, min(cap, base * (2 ** attempt)))
+            log.warning(
+                "Rate limited by Notion API (attempt %d/%d). Retrying in %.1fs …",
+                attempt + 1,
+                max_retries,
+                wait,
+            )
+            time.sleep(wait)
+
+
 def paginate(fn, **kwargs) -> list:
     """Exhaust a paginated Notion API call and return all results."""
     results = []
@@ -395,7 +436,7 @@ def paginate(fn, **kwargs) -> list:
         params = {**kwargs}
         if cursor:
             params["start_cursor"] = cursor
-        resp = fn(**params)
+        resp = retry_with_backoff(fn, **params)
         results.extend(resp.get("results", []))
         if not resp.get("has_more"):
             break
