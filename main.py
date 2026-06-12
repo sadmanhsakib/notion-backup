@@ -9,6 +9,7 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 from notion_client import Client
 from notion_client.errors import APIResponseError
@@ -18,7 +19,7 @@ load_dotenv()
 
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 BACKUP_OUTPUT_DIR = Path(os.getenv("BACKUP_OUTPUT_DIR"))
-MAX_BACKUP = int(os.getenv("MAX_BACKUP", 0))
+MAX_BACKUP = int(os.getenv("MAX_BACKUP")) or 0
 
 # Notion block types that carry downloadable binary assets.
 # Each of these stores its payload under block[block_type]["file"]["url"]
@@ -79,27 +80,52 @@ class NotionBackup:
         self, url: str, media_dir: Path, block_id: str, block_type: str
     ) -> str | None:
         """
-        Download a single asset to media_dir.
-        Returns a relative path string (for embedding in JSON / Markdown), or None on failure.
-        Notion-hosted URLs expire after ~1 hour, so downloading during the run is mandatory.
+        Download a single asset to media_dir using requests (handles HTTPS redirects
+        and authentication headers that urllib silently drops).
+        Returns a relative path string, or None on failure.
+        Notion-hosted URLs expire after ~1h — must be downloaded during the run.
         """
         try:
+            resp = requests.get(
+                url,
+                stream=True,
+                timeout=60,
+                headers={"User-Agent": "NotionBackup/1.0"},
+            )
+            resp.raise_for_status()
+
+            # Derive extension from URL path first; fall back to Content-Type header.
             parsed = urllib.parse.urlparse(url)
-            # The S3 path before the query string usually preserves the original filename.
-            ext = Path(parsed.path).suffix  # e.g. ".png", ".pdf"
+            ext = Path(parsed.path).suffix
             if not ext:
-                # Fall back to a MIME-type guess via a HEAD-like sniff.
-                with urllib.request.urlopen(url) as r:
-                    ctype = r.headers.get_content_type() or ""
+                ctype = resp.headers.get("Content-Type", "").split(";")[0].strip()
                 ext = mimetypes.guess_extension(ctype) or ".bin"
+
             filename = f"{block_type}_{block_id}{ext}"
             dest = media_dir / filename
             if not dest.exists():
-                urllib.request.urlretrieve(url, dest)
+                with open(dest, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=65_536):
+                        fh.write(chunk)
             return f"media/{filename}"
+
+        except requests.HTTPError as e:
+            log.warning(
+                "HTTP %s downloading %s (%s): %s",
+                e.response.status_code,
+                block_type,
+                block_id,
+                url,
+            )
+        except requests.RequestException as e:
+            log.warning(
+                "Network error downloading %s (%s): %s", block_type, block_id, e
+            )
         except Exception as e:
-            log.warning("Could not download %s (%s): %s", block_type, block_id, e)
-            return None
+            log.warning(
+                "Unexpected error downloading %s (%s): %s", block_type, block_id, e
+            )
+        return None
 
     def _download_media_from_blocks(self, blocks: list, media_dir: Path) -> int:
         """
@@ -200,18 +226,30 @@ class NotionBackup:
         return "\n".join(lines)
 
     # ── pages ──────────────────────────────────────────────────────────────────
-    def backup_page(self, page: dict) -> dict:
-        """Fetch a page's full metadata + all its block content."""
+    def backup_page(self, page: dict, media_dir: Path) -> dict:
+        """Fetch a page's metadata + block content, download media, and build Markdown."""
         page_id = page["id"]
         log.info("  → page  %s  (%s)", page_id, safe_title(page))
         blocks = self.fetch_blocks(page_id)
+
+        if not blocks:
+            log.warning(
+                "     ↳ no blocks fetched for page %s. If this page has content, "
+                "open it in Notion → ··· menu → Connections → add your integration.",
+                page_id,
+            )
+
+        n_media = self._download_media_from_blocks(blocks, media_dir)
+        if n_media:
+            log.info("     ↳ downloaded %d media file(s)", n_media)
         return {
             "metadata": page,
             "content": blocks,
+            "markdown": self._blocks_to_markdown(blocks),
         }
 
     # ── databases ──────────────────────────────────────────────────────────────
-    def backup_database(self, db: dict) -> dict:
+    def backup_database(self, db: dict, media_dir: Path) -> dict:
         """Fetch a database's schema + all its rows, each row with full block content."""
         db_id = db["id"]
         log.info("  → db    %s  (%s)", db_id, safe_title(db))
@@ -224,7 +262,7 @@ class NotionBackup:
 
         backed_up_rows = []
         for row in rows:
-            row_data = self.backup_page(row)
+            row_data = self.backup_page(row, media_dir)
             backed_up_rows.append(row_data)
 
         return {
@@ -259,7 +297,7 @@ class NotionBackup:
         # ── back up databases ──
         db_backup = {}
         for db in databases:
-            db_backup[db["id"]] = self.backup_database(db)
+            db_backup[db["id"]] = self.backup_database(db, media_dir)
 
         db_path = backup_dir / "databases.json"
         db_path.write_text(
@@ -278,7 +316,7 @@ class NotionBackup:
 
         page_backup = {}
         for page in standalone_pages:
-            page_backup[page["id"]] = self.backup_page(page)
+            page_backup[page["id"]] = self.backup_page(page, media_dir)
 
         pages_path = backup_dir / "pages.json"
         pages_path.write_text(
@@ -322,6 +360,8 @@ class NotionBackup:
             "duration_seconds": elapsed,
             "databases_count": len(databases),
             "standalone_pages_count": len(standalone_pages),
+            "media_files_downloaded": len(list(media_dir.iterdir())),
+            "markdown_files_written": md_count,
         }
         manifest_path = backup_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -335,10 +375,13 @@ def main():
     backup = NotionBackup(notion=notion, output_dir=BACKUP_OUTPUT_DIR)
     backup.run()
 
-    backup_filenames = [f.name for f in BACKUP_OUTPUT_DIR.glob("backup_*")]
-    backup_filenames = sorted(backup_filenames)
+    backup_filenames = [
+        f for f in os.listdir(OUTPUT_DIR) if f.startswith("backup_")
+    ]
 
     if MAX_BACKUP > 0 and len(backup_filenames) > MAX_BACKUP:
+        backup_filenames.sort()
+
         for filename in backup_filenames[:-MAX_BACKUP]:
             shutil.rmtree(BACKUP_OUTPUT_DIR / filename)
             log.info("Deleted old backup → %s", filename)

@@ -7,5 +7,6 @@ requires-python = ">=3.12"
 dependencies = [
     "dotenv>=0.9.9",
     "notion-client>=3.1.0",
+    "requests>=2.34.2",
     "schedule>=1.2.2",
 ]
