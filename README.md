@@ -1,3 +1,6 @@
+> **⚠️ ARCHIVED PROJECT**  
+> This project is archived and now part of my [automation-toolbox](https://github.com/sadmanhsakib/automation-toolbox) repository.
+
 # notion-backup
 
 A self-hosted Python utility that performs complete, offline-portable backups of a Notion workspace via the official Notion REST API. The tool serialises every page and database the configured integration can access into two complementary output formats — structured JSON (preserving full API fidelity) and rendered Markdown (human-readable, portable) — while eagerly downloading all binary media assets before their Notion-issued signed URLs expire. It is intended for individuals and small teams who require a durable, platform-independent archive of their Notion data without reliance on Notion's proprietary export pipeline.
